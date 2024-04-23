@@ -1,0 +1,622 @@
+---
+title: "Mini Project 3"
+author: "Brenden Bready"
+date: "2024-04-08"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.pos = "!h", fig.align = "center", fig.width = 5, fig.height = 4)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Loading necessary packages
+library(tidyverse)
+library(nflfastR)
+library(BradleyTerry2)
+library(elo)
+library(kableExtra)
+library(knitr)
+library(lme4)
+library(grid)
+library(gridExtra)
+library(rstanarm)
+```
+
+```{r warning=FALSE, message=FALSE, echo=TRUE}
+# Loading in data
+twentytwo = load_pbp(2022)
+twentythree = load_pbp(2023)
+data = rbind(twentytwo, twentythree)
+```
+
+# 1. EPA per Play
+
+For EPA per play, I first filtered out the plays in which there was no team as labeled the possession team (beginning of a quarter, end of a quarter, etc). After this, I grouped by the game id, teams, and whether or not it was the special teams on the field to then calculate the EPA per play and the total EPA. Here, the total EPA is just the EPA per play * Number of plays. A sample of this dataset, which will be used later to calculate the power rankings, can be seen below.
+
+```{r echo = TRUE, message=FALSE}
+# Create EPA dataset
+epa_data = data %>%
+  filter(!is.na(posteam)) %>%
+  group_by(game_id, season, home_team, away_team,
+           posteam, defteam, special) %>%
+  mutate_at(vars(epa), ~ replace_na(., 0)) %>% # Change NA to 0
+  summarise(epa_total = sum(epa),
+            epa_play = mean(epa),
+            plays = n()) %>%
+  ungroup()
+```
+
+```{r warning=FALSE}
+kable(head(epa_data %>%
+             select(-season) %>%
+             mutate(across(where(is.numeric), round, digits = 2))), 
+      caption = "First rows of EPA per Play Dataset")
+```
+
+
+# 2. Bradley-Terry Rankings
+
+To start, we need to set up the dataset to get the final results from each game to calculate wins and losses. This can be seen below.
+
+```{r echo=TRUE, message=FALSE}
+finalScores = data %>%
+  group_by(game_id) %>%
+  select(game_id, season, home_team, away_team, total_home_score, total_away_score) %>%
+  slice(n())
+kable(head(finalScores), caption = "First rows of Final Scores dataset")
+```
+
+Now, I can add a column to indicate whether the home team won, away team won, or it was a tie. From here, I can manipulate the dataset to get the wins of each team against won another home and away.
+
+```{r echo=TRUE, message=FALSE}
+# First, add column to indicate home win, away win, or tie
+finalScores = finalScores %>%
+  mutate(home_win = ifelse(total_home_score > total_away_score, 1, 0),
+         away_win = ifelse(total_away_score > total_home_score, 1, 0),
+         tie = ifelse(total_home_score == total_away_score, 1, 0))
+
+# Change dataset to get number of wins of each team against one another
+wins = finalScores %>%
+  group_by(home_team, away_team, season) %>%
+  summarise(home_wins = sum(home_win), away_wins = sum(away_win), ties = sum(tie)) %>%
+  ungroup(home_team, away_team)
+kable(head(wins), caption = "First rows of Wins dataset")
+```
+
+To run the Bradley Terry model, I first have to change my teams to factors. Since I need the model in terms of wins and losses, I will add all ties as half a win for each team. Below I fit the model for both the 2022 and 2023 seasons without home field advantage, and a summary of the output for the 2022 season is shown below.
+
+```{r warning=FALSE, message=FALSE, echo=TRUE}
+# Changing to factors so model runs properly
+wins$home_team = as.factor(wins$home_team)
+wins$away_team = as.factor(wins$away_team)
+
+# Add ties as half a win
+wins = wins %>%
+  mutate(home_wins = home_wins + 0.5*ties,
+         away_wins = away_wins + 0.5*ties)
+
+# Separate seasons
+wins2022 = wins %>%
+  filter(season == 2022)
+wins2023 = wins %>%
+  filter(season == 2023)
+
+# Fit Bradley Terry for 2022
+bt22mod = BTm(cbind(home_wins, away_wins), home_team, away_team, 
+                  data = wins2022, id = "team")
+
+# Fit Bradley Terry for 2023
+bt23mod = BTm(cbind(home_wins, away_wins), home_team, away_team, 
+                  data = wins2023, id = "team")
+
+summary(bt22mod)
+```
+
+Now, I will add to this model to account for home field advantage. This can be seen below, along with the AIC and BIC for both seasons and both models, showing that adding home field advantage helps improve our model fit.
+
+```{r warning=FALSE, echo=TRUE}
+# Add in information about home field advantage
+wins2022$home_team <- data.frame(team = wins2022$home_team, at_home = 1)
+wins2022$away_team <- data.frame(team = wins2022$away_team, at_home = -1)
+wins2023$home_team <- data.frame(team = wins2023$home_team, at_home = 1)
+wins2023$away_team <- data.frame(team = wins2023$away_team, at_home = -1)
+
+# Fit the new Bradley Terry models
+bt22mod2 <- update(bt22mod, formula = ~ team + at_home)
+bt23mod2 <- update(bt23mod, formula = ~ team + at_home)
+```
+
+```{r}
+# Compare the Fit of both models
+AIC22NoHome = AIC(bt22mod)
+BIC22NoHome = BIC(bt22mod)
+AIC22Home = AIC(bt22mod2)
+BIC22Home = BIC(bt22mod2)
+AIC23NoHome = AIC(bt23mod)
+BIC23NoHome = BIC(bt23mod)
+AIC23Home = AIC(bt23mod2)
+BIC23Home = BIC(bt23mod2)
+
+AICs = c(AIC22NoHome, AIC22Home, AIC23NoHome, AIC23Home)
+BICs = c(BIC22NoHome, BIC22Home, BIC23NoHome, BIC23Home)
+Season = c(2022, 2022, 2023, 2023)
+Advantage = c("None", "Home Field", "None", "Home Field")
+fits = data.frame(Season, Advantage, AICs, BICs)
+kable(fits %>%
+        mutate(across(where(is.numeric), round, digits = 2)),
+      caption = "AIC and BIC by Model and Season")
+```
+
+In both seasons, we see that the AIC and BIC are both lower when we include information about the home field advantage. Now, let's look at the top 10 ranked teams from each season.
+
+```{r}
+# Get the rankings as a named vector for each season
+btranks22 = c(exp(BTabilities(bt22mod))[,1])
+btranks22 = data.frame(team = names(btranks22), BTRating = btranks22, row.names = NULL)
+btranks22 = btranks22 %>%
+  arrange(desc(BTRating))
+btranks23 = c(exp(BTabilities(bt23mod))[,1])
+btranks23 = data.frame(team = names(btranks23), BTRating = btranks23, row.names = NULL)
+btranks23 = btranks23 %>%
+  arrange(desc(BTRating))
+
+kable(head(btranks22 %>%
+             mutate(across(where(is.numeric), round, digits = 2)), 10), 
+      caption = "Top 10 Teams in 2022-2023 season by Bradley Terry")
+kable(head(btranks23 %>%
+             mutate(across(where(is.numeric), round, digits = 2)), 10), 
+      caption = "Top 10 Teams in 2023-2024 season by Bradley Terry")
+```
+
+Here, the most surprising result I immediately noticed was that the Chiefs were ranked third this year despite winning the Superbowl. However, Baltimore and San Francisco did have a better regular season record than the Chiefs, so this is an unsurprising result for a model that only considers wins and losses.
+
+# 3. ELO
+
+For the ELO ratings, I can use the final scores dataset I created as I began the portion of the Bradley Terry analysis. A sample of the data I will use can be seen below.
+
+```{r}
+kable(head(finalScores %>%
+             select(-season) %>%
+             rename(home_score = total_home_score,
+                    away_score = total_away_score)), caption = "Sample of Final Scores Data")
+```
+
+The question for the ELO ratings is what value to use for our learning rate K. To choose an appropriate, I will run the model for all values of k from 0.1 to 50 (by 0.1), and then select the model with the smallest MSE.
+
+```{r}
+finalScores22 = finalScores %>%
+  filter(season == 2022)
+finalScores23 = finalScores %>%
+  filter(season == 2023)
+```
+
+
+```{r echo=TRUE}
+# Find the value of k with the smallest MSE
+mses = c()
+for(i in seq(1, 100, by = 0.2)){
+  elo22mod = elo.run(score(total_home_score, total_away_score) ~ home_team + away_team,
+                     data = finalScores22,
+                     k = i)
+  mses = append(mses, summary(elo22mod)$mse)
+}
+min(mses)
+which.min(mses) * 0.2
+```
+
+```{r}
+# Find the value of k with the smallest MSE
+mses = c()
+for(i in seq(1, 100, by = 0.2)){
+  elo23mod = elo.run(score(total_home_score, total_away_score) ~ home_team + away_team,
+                     data = finalScores23,
+                     k = i)
+  mses = append(mses, summary(elo23mod)$mse)
+}
+# Output was MSE of 0.245 and k=24.8
+```
+
+After running this loop, I see that the smallest MSE for 2022 was 0.231 when K was 52.6. I will use this as my learning rate, and then fit the ELO model with results below. While not shown directly above, I did the same code for 2023, finding an MSE of 0.245 at k=24.8. 
+
+```{r echo=TRUE}
+# Find percentage of time home teams wins (56.7)
+hfaELO = as.numeric(finalScores %>%
+  ungroup() %>%
+  summarise(mean(home_win))*100)
+
+# Fit ELO models for 2022 and 2023
+elo22mod = elo.run(score(total_home_score, total_away_score) ~ 
+                     adjust(home_team, hfaELO) + away_team,
+                     data = finalScores22,
+                     k = 52.6)
+elo23mod = elo.run(score(total_home_score, total_away_score) ~ 
+                     adjust(home_team, hfaELO) + away_team,
+                     data = finalScores23,
+                     k = 24.8)
+
+# ELO Ratings by Team
+final_elos22 = final.elos(elo22mod) %>% 
+  enframe() %>% 
+  arrange(desc(value))
+final_elos23 = final.elos(elo23mod) %>% 
+  enframe() %>% 
+  arrange(desc(value))
+
+kable(head(final_elos22, 10), caption = "Top 10 Teams by ELO 2022-2023 Season")
+kable(head(final_elos23, 10), caption = "Top 10 Teams by ELO 2023-2024 Season")
+```
+
+In the ELO model with a home field advantage adjustment, we now see the Chiefs unsurprisingly take the top spot for both seasons. An interesting note is that in 2022-2023 season, the Eagles made it to the superbowl but are ranked fifth by ELO, although their rating is very close to all three teams above them. 
+
+# 4. Power Rankings
+
+For the power ratings, I will use the dataset from the EPA per play, but split the data into two sets of special teams and non-special teams. The start of the data for non-special teams is seen below. As a note, the data is only rounded to fit nicer in the display, it was not rounded for the calculations.
+
+```{r echo=TRUE}
+# Start by filtering out the special teams, add home team column
+prdata = epa_data %>%
+  filter(special == 0) %>%
+  select(game_id, season, home_team, away_team, posteam, defteam, 
+         epa_total, epa_play, plays) %>%
+  mutate(team_home = ifelse(home_team == posteam, 1, -1))
+
+# Data of only special teams
+prdataSpecial = epa_data %>%
+  filter(special == 1) %>%
+  select(game_id, season, home_team, away_team, posteam, defteam, 
+         epa_total, epa_play, plays) %>%
+  mutate(team_home = ifelse(home_team == posteam, 1, -1))
+
+kable(head(prdata %>%
+             mutate(across(where(is.numeric), round, digits = 2))), 
+      caption = "Sample of EPA Data No Special Teams")
+```
+
+```{r}
+# Filter data to different seasons
+prdata22 = prdata %>%
+  filter(season == 2022)
+prdata23 = prdata %>%
+  filter(season == 2023)
+prdataSpecial22 = prdataSpecial %>%
+  filter(season == 2022)
+prdataSpecial23 = prdataSpecial %>%
+  filter(season == 2023)
+```
+
+Now that we have the datasets, we can apply the stan_glmer function to our four different datasets to get the team effects for each season. The model fitting can be seen below.
+
+```{r message=FALSE, warning=FALSE, echo=TRUE}
+# Building the stan models
+stan_mod22 <- stan_glmer(epa_play ~ team_home + (1|posteam) + (1|defteam), 
+             data = prdata22, 
+             iter = 500, 
+             chains = 2,
+             refresh = 0) # Use this line to hide the sampling details
+stan_mod23 <- stan_glmer(epa_play ~ team_home + (1|posteam) + (1|defteam), 
+             data = prdata23, 
+             iter = 500, 
+             chains = 2,
+             refresh = 0) # Use this line to hide the sampling details
+stan_mod22Special <- stan_glmer(epa_play ~ team_home + (1|posteam) + (1|defteam), 
+             data = prdataSpecial22, 
+             iter = 500, 
+             chains = 2,
+             refresh = 0) # Use this line to hide the sampling details
+stan_mod23Special <- stan_glmer(epa_play ~ team_home + (1|posteam) + (1|defteam), 
+             data = prdataSpecial23, 
+             iter = 500, 
+             chains = 2,
+             refresh = 0) # Use this line to hide the sampling details
+```
+
+Now that our models have been fit, we can get the overall team effects. I will normalize the data by multiplying the offensive and defensive effects (no special teams) by the average number of plays in the 2022 season (73.3) and the special teams effects by multiplying by the average number of special teams plays per game during the season (13.2). I will show the 2022 code to get the power rankings below, and details for 2023 (which are the same as 2022) can be found in the appendix at the end.
+
+```{r echo=TRUE}
+# Mean number of plays in 2022 to normalize
+plays22 = as.numeric(prdata22 %>%
+  summarise(mean(plays)))
+plays22Special = as.numeric(prdataSpecial22 %>%
+  summarise(mean(plays)))
+
+# Get team effects without special teams
+bayes_team_effects22 <- tibble(team = row.names(ranef(stan_mod22)$posteam),
+                         bayes_off = ranef(stan_mod22)$posteam[,1]) %>% 
+  full_join(
+    tibble(team = row.names(ranef(stan_mod22)$defteam),
+           bayes_def = -ranef(stan_mod22)$defteam[,1]),
+    by = c("team")
+  ) %>% 
+  mutate(bayes_off = bayes_off*plays22,
+         bayes_def = bayes_def*plays22)
+
+bayes_special_effects22 <- tibble(team = row.names(ranef(stan_mod22Special)$posteam),
+                         bayes_off_special = ranef(stan_mod22Special)$posteam[,1]) %>% 
+  full_join(
+    tibble(team = row.names(ranef(stan_mod22Special)$defteam),
+           bayes_def_special = -ranef(stan_mod22Special)$defteam[,1]),
+    by = c("team")
+  ) %>% 
+  mutate(bayes_off_special = bayes_off_special*plays22Special,
+         bayes_def_special = bayes_def_special*plays22Special)
+
+# Combining and getting our Bayes effects for 2022
+bayes_effects22 = left_join(bayes_team_effects22, bayes_special_effects22, by = "team") %>%
+  mutate(bayes_off = bayes_off + bayes_off_special,
+         bayes_def = bayes_def + bayes_def_special,
+         bayes_team = bayes_off + bayes_def,
+         power_rank = min_rank(desc(bayes_team))) %>%
+  arrange(power_rank) %>%
+  select(team, bayes_off, bayes_def, bayes_team, power_rank)
+
+kable(head(bayes_effects22 %>%
+             mutate(across(where(is.numeric), round, digits = 3)), 10), 
+      caption = "Top 10 Teams By Power Ranking 2022-2023 Season")
+```
+
+```{r}
+# Mean number of plays in 2023 to normalize
+plays23 = as.numeric(prdata23 %>%
+  summarise(mean(plays)))
+plays23Special = as.numeric(prdataSpecial23 %>%
+  summarise(mean(plays)))
+
+# Get team effects without special teams
+bayes_team_effects23 <- tibble(team = row.names(ranef(stan_mod23)$posteam),
+                         bayes_off = ranef(stan_mod23)$posteam[,1]) %>% 
+  full_join(
+    tibble(team = row.names(ranef(stan_mod23)$defteam),
+           bayes_def = -ranef(stan_mod23)$defteam[,1]),
+    by = c("team")
+  ) %>% 
+  mutate(bayes_off = bayes_off*plays23,
+         bayes_def = bayes_def*plays23)
+
+bayes_special_effects23 <- tibble(team = row.names(ranef(stan_mod23Special)$posteam),
+                         bayes_off_special = ranef(stan_mod23Special)$posteam[,1]) %>% 
+  full_join(
+    tibble(team = row.names(ranef(stan_mod23Special)$defteam),
+           bayes_def_special = -ranef(stan_mod23Special)$defteam[,1]),
+    by = c("team")
+  ) %>% 
+  mutate(bayes_off_special = bayes_off_special*plays23Special,
+         bayes_def_special = bayes_def_special*plays23Special)
+
+# Combining and getting our Bayes effects for 2023
+bayes_effects23 = left_join(bayes_team_effects23, bayes_special_effects23, by = "team") %>%
+  mutate(bayes_off = bayes_off + bayes_off_special,
+         bayes_def = bayes_def + bayes_def_special,
+         bayes_team = bayes_off + bayes_def,
+         power_rank = min_rank(desc(bayes_team))) %>%
+  arrange(power_rank) %>%
+  select(team, bayes_off, bayes_def, bayes_team, power_rank)
+
+kable(head(bayes_effects23 %>%
+             mutate(across(where(is.numeric), round, digits = 3)), 10), 
+      caption = "Top 10 Teams By Power Ranking 2023-2024 Season")
+```
+
+The power rankings give the most interesting result, with the Chiefs being ranked 5th last year despite winning the Superbowl. Other teams such as San Francisco, Baltimore, and Buffalo all appear right at the top, which is unsurprising as these were the other teams in the conference championships. The team that is most surprising to see towards the top is the Dallas Cowboys, but after looking at their results it seems their high scoring offense helps pull them up. In 2022 the rankings were a bit more standard, with the four teams in the Conference Championships taking the top four spots.
+
+# 5. Bayes Power Rankings
+
+For fitting the Bayes Power Rankings, I references the power rankings example file and used the Stan file provided from class. Below is the code I used, where I altered the unique teams dataset and created my own Bayes dataset to fit the requirements for the Stan Data, and then ran the models for each of the seasons. I approached this the same as the power rankings above, where I fit the model for special teams and non-special teams, and then combined the information at the end for the cumulative ratings. Since I only had two seasons loaded for this project, I only did a Bayes Power Ranking for 2023-2024 season using the previous season's power rankings as my prior.
+
+```{r echo=TRUE, warning=FALSE}
+# Create our unique teams dataset with priors from previous season
+unique_teams22 = bayes_team_effects22 %>%
+  mutate(team_index = 1:n(),
+         off_team_prior_mean = bayes_off, 
+         def_team_prior_mean = bayes_def
+         ) %>%
+  select(team, team_index, off_team_prior_mean, def_team_prior_mean)
+
+# Create a dataset (I called bayesdata), which contains the team index for each team
+bayesdata = left_join(prdata23, unique_teams22, by = join_by(posteam == team)) %>%
+  rename(off_team_index = team_index)
+bayesdata = left_join(bayesdata, unique_teams22, by = join_by(defteam == team)) %>%
+  rename(def_team_index = team_index)
+
+# Create our stan dataset, where 2023 EPA is our response, 2022 as prior
+stan_data22 <- list(y = bayesdata$epa_play * plays23, 
+                  N = nrow(bayesdata), 
+                  
+                  hfa = bayesdata$team_home, 
+                  
+                  n_teams = nrow(unique_teams22),
+                  
+                  off_team_prior_mean = unique_teams22$off_team_prior_mean,
+                  def_team_prior_mean = unique_teams22$def_team_prior_mean,
+                  
+                  off_team_index = bayesdata$off_team_index,
+                  def_team_index = bayesdata$def_team_index
+                  )
+
+stan_with_prior_model22 <- rstan::stan(file = "power_rating_with_prior.stan", 
+                                     data = stan_data22, 
+                                     seed = 5,
+                                     iter = 650, 
+                                     warmup =150, 
+                                     chains = 2, 
+                                     thin = 1,
+                                     save_warmup = FALSE,
+                                     refresh = 0)
+```
+
+```{r warning=FALSE, message=FALSE}
+# Now, same analysis as above but with special teams
+unique_teams22Special = bayes_special_effects22 %>%
+  mutate(team_index = 1:n(),
+         off_team_prior_mean = bayes_off_special, 
+         def_team_prior_mean = bayes_def_special
+         ) %>%
+  select(team, team_index, off_team_prior_mean, def_team_prior_mean)
+
+# Create a dataset (I called bayesdataSpecial), which contains the team index for each team
+bayesdataSpecial = left_join(prdata23, unique_teams22Special, by = join_by(posteam == team)) %>%
+  rename(off_team_index = team_index)
+bayesdataSpecial = left_join(bayesdataSpecial, unique_teams22Special, 
+                             by = join_by(defteam == team)) %>%
+  rename(def_team_index = team_index)
+
+# Create our stan dataset, where 2023 EPA is our response, 2022 as prior
+stan_data22Special <- list(y = bayesdataSpecial$epa_play*plays23Special, 
+                  N = nrow(bayesdataSpecial), 
+                  
+                  hfa = bayesdataSpecial$team_home, 
+                  
+                  n_teams = nrow(unique_teams22Special),
+                  
+                  off_team_prior_mean = unique_teams22Special$off_team_prior_mean,
+                  def_team_prior_mean = unique_teams22Special$def_team_prior_mean,
+                  
+                  off_team_index = bayesdataSpecial$off_team_index,
+                  def_team_index = bayesdataSpecial$def_team_index
+                  )
+
+stan_with_prior_model22Special <- rstan::stan(file = "power_rating_with_prior.stan", 
+                                     data = stan_data22Special, 
+                                     seed = 5,
+                                     iter = 1000, 
+                                     warmup =150, 
+                                     chains = 2, 
+                                     thin = 1,
+                                     save_warmup = FALSE,
+                                     refresh = 0)
+```
+
+Now that the models have been fit, I can clean the data and add together the special teams and non-special teams information to get the overall team estimates and rankings.
+
+```{r echo=TRUE}
+# Clean the data to get our Bayes Power Ranking for each team
+bayes_w_prior_coefficients23 <- broom.mixed::tidy(stan_with_prior_model22)
+bayes_team_effects23_priors <- bayes_w_prior_coefficients23 %>% 
+  filter(str_detect(term, "off|def")) %>% 
+  mutate(off_def = ifelse(str_detect(term, "off"), "off", "def"),
+         team_index = str_extract(term, "[[:digit:]]+")) %>% 
+  select(-term) %>% 
+  pivot_wider(values_from = c('estimate', 'std.error'),
+              names_from = 'off_def') %>% 
+  mutate(estimate_def = -estimate_def) %>% 
+  mutate(bayes_team_estimate = estimate_off + estimate_def) %>% 
+  mutate(team_index = as.numeric(team_index)) %>% 
+  left_join(unique_teams22 %>% mutate(team_index = as.numeric(team_index)), 
+            by = 'team_index')
+bayes23ranks_priors = bayes_team_effects23_priors %>%
+  select(team, bayes_team_estimate)
+
+# Do the same for special teams ranks
+bayes_w_prior_coefficients23Special <- broom.mixed::tidy(stan_with_prior_model22Special)
+bayes_team_effects23_priorsSpecial <- bayes_w_prior_coefficients23Special %>% 
+  filter(str_detect(term, "off|def")) %>% 
+  mutate(off_def = ifelse(str_detect(term, "off"), "off", "def"),
+         team_index = str_extract(term, "[[:digit:]]+")) %>% 
+  select(-term) %>% 
+  pivot_wider(values_from = c('estimate', 'std.error'),
+              names_from = 'off_def') %>% 
+  mutate(estimate_def = -estimate_def) %>% 
+  mutate(bayes_team_estimate_special = estimate_off + estimate_def) %>% 
+  mutate(team_index = as.numeric(team_index)) %>% 
+  left_join(unique_teams22 %>% mutate(team_index = as.numeric(team_index)), 
+            by = 'team_index')
+bayes23ranks_priorsSpecial = bayes_team_effects23_priorsSpecial %>%
+  select(team, bayes_team_estimate_special)
+
+bayes23ranks_priors = left_join(bayes23ranks_priors, bayes23ranks_priorsSpecial, by = "team") %>%
+  mutate(bayes_estimate_prior = bayes_team_estimate + bayes_team_estimate_special,
+         bayes_rank = min_rank(desc(bayes_estimate_prior))) %>%
+  select(team, bayes_estimate_prior, bayes_rank) %>%
+  arrange(bayes_rank)
+```
+
+```{r}
+kable(head(bayes23ranks_priors %>%
+            mutate(across(where(is.numeric), round, digits = 3)), 10), 
+            caption = "Top 10 Teams by Bayes Rankings for 2023 using 2022 as Prior")
+```
+
+
+While I am unsure of how to interpret our power rank estimates here, the Bayes rankings seem to be a combination of the previous sections rankings. Here we see our super bowl winners ranked 4th, but again the same repeat teams as our top. I will discuss more about the rankings in the next section.
+
+
+# 6. Comparing the Models
+
+```{r}
+btranks22 = btranks22 %>%
+  mutate(BTrank = row_number())
+btranks23 = btranks23 %>%
+  mutate(BTrank = row_number())
+final_elos22 = final_elos22 %>%
+  mutate(ELOrank = row_number(),
+         team = name)
+final_elos23 = final_elos23 %>%
+  mutate(ELOrank = row_number(),
+         team = name)
+bayes_effects22 = bayes_effects22 %>%
+  mutate(PowerRank = row_number())
+bayes_effects23 = bayes_effects23 %>%
+  mutate(PowerRank = row_number())
+
+# Make the rankings in one dataset
+ranks22 <- list(btranks22, final_elos22, bayes_effects22)
+
+# Using Reduce to join all data frames by 'id'
+ranks22 <- Reduce(function(x, y) left_join(x, y, by = "team"), ranks22)
+
+ranks22 = ranks22 %>%
+  mutate(ELO_value = value, PR_value = bayes_team) %>%
+  select(team, BTRating, BTrank, ELO_value, ELOrank, PR_value, power_rank)
+
+# Now for 2023
+ranks23 <- list(btranks23, final_elos23, bayes_effects23, bayes23ranks_priors)
+
+# Using Reduce to join all data frames by 'id'
+ranks23 <- Reduce(function(x, y) left_join(x, y, by = "team"), ranks23)
+
+ranks23 = ranks23 %>%
+  mutate(ELO_value = value, PR_value = bayes_team) %>%
+  select(team, BTRating, BTrank, ELO_value, ELOrank, PR_value, power_rank, 
+         bayes_estimate_prior, bayes_rank)
+```
+
+Now that all the models have been run, we can view the full rankings for each season. To start I will discuss the 2022-2023 rankings, with a summary table shown below arranged by the average of the 3 rankings.
+
+```{r warning=FALSE}
+ranks22 <- ranks22 %>%
+  mutate(across(where(is.numeric), round, digits = 3))
+kable(ranks22 %>%
+  arrange((BTrank + ELOrank + power_rank)/3), 
+  caption = "Comparison of Rankings Across Models for 2022-2023 Season")
+```
+
+
+After running all of the models, the most consistent part of the analysis was the the Chiefs were ranked as the top team for the 2022-2023 season. Spots 2 through 5 varied a little, but in each of the models it was either the Bills, 49ers, Eagles, or Bengals. Across all three models, Houston was always ranked as either the worst or second worst team. The largest discrepancy seems to come with the Vikings, who were ranked 5th by Bradley Terry, 7th by ELO, but 17th by the Power Rankings. This is likely due to the fact that they had a fairly strong winning record, but their EPA per play was still very small. I will discuss more about reasons for differences after the looking at the results for the 2023-2024 season which is seen below.
+
+```{r}
+ranks23 <- ranks23 %>%
+  mutate(across(where(is.numeric), round, digits = 3))
+kable(ranks23 %>%
+  arrange((BTrank + ELOrank + power_rank + bayes_rank)/4), 
+  caption = "Comparison of Rankings Across Models for 2023-2024 Season")
+```
+
+
+The 2023-2024 provided many more discrepancies than the previous season. The table is arranged by the average of the four rankings. The ELO model ranked Kansas City as the best team, which seemed fitting since they won the Superbowl. However, Bradley Terry, Power Rankings, and Bayes Power Rankings ranked them 3rd, 5th, and 4th respectively. All four of the models had a different team as the top and bottom teams, but New England, Washington, and Carolina typically made up the bottom 3. 
+
+The differences are to be expected based on the different ways the models calculate the rankings. Bradley Terry only considers wins and losses, so a 60-0 win is treated the same as a 17-16 win. ELO considers the score, and power rankings consider how well the team is consistently across every play. The Bayes Power rankings seemed to bring teams from the power rankings towards a ranking that was closer to how the team actually finished, because we used the previous season as a prior. For example, we knew from the previous season that the Chiefs were a top team, so our Bayes Power Rankings brought them from 5th up to 4th. The new model considered a team's performance this season as well as their previous season.
+
+While none of the rankings are perfect, this project shows how there are many different methods to effectively rank sports teams. Some methods, such as Bradley Terry, appear to be more naive than others, but that does not make the rankings any less valid. There is always variability in sports, and there will likely never be a completely perfect ranking system that everyone agrees on.
+
+\newpage
+
+# Appendix
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
+
+
+
+
